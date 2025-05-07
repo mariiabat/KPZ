@@ -1,0 +1,92 @@
+import yfinance as yf
+import pandas as pd
+import plotly.graph_objects as go
+
+symbol = "ES=F"
+range_len = 15
+start = "2024-01-01"
+end = "2025-01-01"
+
+df = yf.download(symbol, interval="1d", start=start, end=end)
+df.dropna(inplace=True)
+df.reset_index(inplace=True)
+
+long_blocks = []
+short_blocks = []
+structure_low = df['Low'].rolling(window=range_len).min().shift(1)
+structure_low_index = df['Low'].rolling(window=range_len).apply(lambda x: x.idxmin(), raw=True).shift(1)
+
+last_up_index = None
+last_up_low = None
+last_high = None
+last_down_index = None
+last_down = None
+last_low = None
+last_long_index = -1000
+last_short_index = -1000
+
+for i in range(range_len, len(df)):
+    row = df.iloc[i]
+    prev_row = df.iloc[i - 1]
+
+    if row['Close'] < row['Open']:
+        last_down = row['High']
+        last_down_index = i
+        last_low = row['Low']
+    elif row['Close'] > row['Open']:
+        last_up_index = i
+        last_up_low = row['Low']
+        last_high = row['High']
+
+    if row['Low'] < structure_low[i]:
+        if last_up_index and (i - last_up_index) < 1000:
+            short_blocks.append({
+                "left": last_up_index,
+                "right": i,
+                "top": last_high,
+                "bottom": last_up_low
+            })
+            last_short_index = last_up_index
+
+    for idx, box in reversed(list(enumerate(short_blocks))):
+        if row['Close'] > box['top']:
+            short_blocks.pop(idx)
+            if last_down_index and (i - last_down_index) < 1000 and i > last_long_index:
+                long_blocks.append({
+                    "left": last_down_index,
+                    "right": i,
+                    "top": last_down,
+                    "bottom": last_low
+                })
+                last_long_index = i
+
+# --- Побудова графіка ---
+fig = go.Figure()
+
+# Свічки
+fig.add_trace(go.Candlestick(
+    x=df['Date'], open=df['Open'], high=df['High'],
+    low=df['Low'], close=df['Close'], name="Candles"))
+
+# Блоки ордерів
+for block in long_blocks:
+    fig.add_shape(type="rect",
+                  x0=df['Date'][block['left']],
+                  x1=df['Date'][block['right']],
+                  y0=block['bottom'],
+                  y1=block['top'],
+                  fillcolor="rgba(0,255,0,0.3)",
+                  line=dict(color="green", width=1))
+
+for block in short_blocks:
+    fig.add_shape(type="rect",
+                  x0=df['Date'][block['left']],
+                  x1=df['Date'][block['right']],
+                  y0=block['bottom'],
+                  y1=block['top'],
+                  fillcolor="rgba(255,0,0,0.3)",
+                  line=dict(color="red", width=1))
+
+fig.update_layout(title=f"Order Blocks for {symbol}",
+                  xaxis_title="Date", yaxis_title="Price")
+fig.show()
