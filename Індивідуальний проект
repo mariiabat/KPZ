@@ -1,92 +1,231 @@
-import yfinance as yf
 import pandas as pd
+import numpy as np
+import yfinance as yf
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-symbol = "ES=F"
-range_len = 15
-start = "2024-01-01"
-end = "2025-01-01"
+class OrderBlocksIndicator:
+    def __init__(self, candle_range=15, show_pdh_pdl=False, show_bearish_bos=False, show_bullish_bos=False):
+        self.range = candle_range
+        self.show_pdh_pdl = show_pdh_pdl
+        self.show_bearish_bos = show_bearish_bos
+        self.show_bullish_bos = show_bullish_bos
+        self.reset_state()
 
-df = yf.download(symbol, interval="1d", start=start, end=end)
-df.dropna(inplace=True)
-df.reset_index(inplace=True)
+    def reset_state(self):
+        self.last_down_index = 0
+        self.last_down = 0
+        self.last_low = 0
+        self.last_up_index = 0
+        self.last_up = 0
+        self.last_up_low = 0
+        self.last_up_open = 0
+        self.last_high = 0
+        self.last_bull_break_low = 0
+        self.structure_low_index = 0
+        self.structure_low = float('inf')
+        self.long_boxes = []
+        self.short_boxes = []
+        self.bos_lines = []
+        self.last_long_index = 0
+        self.last_short_index = 0
+        self.entries = []
+        self.exits = []
 
-long_blocks = []
-short_blocks = []
-structure_low = df['Low'].rolling(window=range_len).min().shift(1)
-structure_low_index = df['Low'].rolling(window=range_len).apply(lambda x: x.idxmin(), raw=True).shift(1)
+    def load_data(self, symbol, period="3mo", interval="1h"):
+        data = yf.download(symbol, period=period, interval=interval)
+        data['bar_index'] = range(len(data))
+        return data
 
-last_up_index = None
-last_up_low = None
-last_high = None
-last_down_index = None
-last_down = None
-last_low = None
-last_long_index = -1000
-last_short_index = -1000
+    def find_structure_low(self, data, start_idx, end_idx):
+        if start_idx >= end_idx or start_idx < 0:
+            return float('inf'), 0
+        subset = data.iloc[start_idx:end_idx]
+        if subset.empty:
+            return float('inf'), 0
+        min_pos = subset['Low'].values.argmin()
+        min_row = subset.iloc[min_pos]
+        min_value = float(min_row['Low'])
+        min_bar_index = int(min_row['bar_index'])
+        return min_value, min_bar_index
 
-for i in range(range_len, len(df)):
-    row = df.iloc[i]
-    prev_row = df.iloc[i - 1]
+    def process_data(self, data):
+        data['BOS_Candle'] = False
+        data['Candle_Color_Mode'] = 0
+        opens = data['Open'].values
+        highs = data['High'].values
+        lows = data['Low'].values
+        closes = data['Close'].values
+        bar_indices = data['bar_index'].values
+        bos_candles = [False] * len(data)
+        candle_color_modes = [0] * len(data)
+        position = None
 
-    if row['Close'] < row['Open']:
-        last_down = row['High']
-        last_down_index = i
-        last_low = row['Low']
-    elif row['Close'] > row['Open']:
-        last_up_index = i
-        last_up_low = row['Low']
-        last_high = row['High']
+        for i in range(1, len(data)):
+            current_open = opens[i]
+            current_high = highs[i]
+            current_low = lows[i]
+            current_close = closes[i]
+            current_bar_index = bar_indices[i]
+            prev_low = lows[i - 1]
 
-    if row['Low'] < structure_low[i]:
-        if last_up_index and (i - last_up_index) < 1000:
-            short_blocks.append({
-                "left": last_up_index,
-                "right": i,
-                "top": last_high,
-                "bottom": last_up_low
-            })
-            last_short_index = last_up_index
+            look_back = i if i < self.range else self.range
+            structure_low, structure_low_index = self.find_structure_low(data, i - look_back, i)
 
-    for idx, box in reversed(list(enumerate(short_blocks))):
-        if row['Close'] > box['top']:
-            short_blocks.pop(idx)
-            if last_down_index and (i - last_down_index) < 1000 and i > last_long_index:
-                long_blocks.append({
-                    "left": last_down_index,
-                    "right": i,
-                    "top": last_down,
-                    "bottom": last_low
-                })
-                last_long_index = i
+            if current_close < current_open:
+                self.last_down = current_high
+                self.last_down_index = current_bar_index
+                self.last_low = current_low
 
-# --- Побудова графіка ---
-fig = go.Figure()
+            if current_close > current_open:
+                self.last_up = current_close
+                self.last_up_index = current_bar_index
+                self.last_up_open = current_open
+                self.last_up_low = current_low
+                self.last_high = current_high
 
-# Свічки
-fig.add_trace(go.Candlestick(
-    x=df['Date'], open=df['Open'], high=df['High'],
-    low=df['Low'], close=df['Close'], name="Candles"))
+            self.last_high = max(current_high, self.last_high)
+            self.last_low = min(current_low, self.last_low)
 
-# Блоки ордерів
-for block in long_blocks:
-    fig.add_shape(type="rect",
-                  x0=df['Date'][block['left']],
-                  x1=df['Date'][block['right']],
-                  y0=block['bottom'],
-                  y1=block['top'],
-                  fillcolor="rgba(0,255,0,0.3)",
-                  line=dict(color="green", width=1))
+            if current_low < structure_low and prev_low >= structure_low:
+                if (current_bar_index - self.last_up_index) < 1000:
+                    self.short_boxes.append({
+                        'left': self.last_up_index,
+                        'top': self.last_high,
+                        'bottom': self.last_up_low,
+                        'right': self.last_up_index
+                    })
+                    if self.show_bearish_bos:
+                        self.bos_lines.append({
+                            'x0': structure_low_index,
+                            'y0': structure_low,
+                            'x1': current_bar_index,
+                            'y1': structure_low,
+                            'color': 'red'
+                        })
+                    bos_candles[i] = True
+                    candle_color_modes[i] = 0
+                    self.last_short_index = self.last_up_index
 
-for block in short_blocks:
-    fig.add_shape(type="rect",
-                  x0=df['Date'][block['left']],
-                  x1=df['Date'][block['right']],
-                  y0=block['bottom'],
-                  y1=block['top'],
-                  fillcolor="rgba(255,0,0,0.3)",
-                  line=dict(color="red", width=1))
+            short_boxes_to_remove = []
+            for j, short_box in enumerate(self.short_boxes):
+                if current_close > short_box['top']:
+                    short_boxes_to_remove.append(j)
+                    if ((current_bar_index - self.last_down_index) < 1000 and current_bar_index > self.last_long_index):
+                        self.long_boxes.append({
+                            'left': self.last_down_index,
+                            'top': self.last_down,
+                            'bottom': self.last_low,
+                            'right': self.last_down_index
+                        })
+                        if self.show_bullish_bos:
+                            self.bos_lines.append({
+                                'x0': short_box['left'],
+                                'y0': short_box['top'],
+                                'x1': current_bar_index,
+                                'y1': short_box['top'],
+                                'color': 'green'
+                            })
+                        bos_candles[i] = True
+                        candle_color_modes[i] = 1
+                        self.last_long_index = current_bar_index
+                        self.last_bull_break_low = current_low
 
-fig.update_layout(title=f"Order Blocks for {symbol}",
-                  xaxis_title="Date", yaxis_title="Price")
-fig.show()
+            for idx in reversed(short_boxes_to_remove):
+                self.short_boxes.pop(idx)
+
+            long_boxes_to_remove = []
+            for j, long_box in enumerate(self.long_boxes):
+                if current_close < long_box['bottom']:
+                    long_boxes_to_remove.append(j)
+
+            for idx in reversed(long_boxes_to_remove):
+                self.long_boxes.pop(idx)
+
+            # Strategy Logic
+            if position is None:
+                for box in self.long_boxes:
+                    if box['bottom'] <= current_low <= box['top']:
+                        position = {'type': 'long', 'entry_price': current_close, 'entry_index': current_bar_index}
+                        self.entries.append((data.index[i], current_close, 'buy'))
+                        break
+                for box in self.short_boxes:
+                    if box['bottom'] <= current_high <= box['top']:
+                        position = {'type': 'short', 'entry_price': current_close, 'entry_index': current_bar_index}
+                        self.entries.append((data.index[i], current_close, 'sell'))
+                        break
+            else:
+                if position['type'] == 'long' and current_close < position['entry_price'] * 0.98:
+                    self.exits.append((data.index[i], current_close, 'exit long'))
+                    position = None
+                elif position['type'] == 'short' and current_close > position['entry_price'] * 1.02:
+                    self.exits.append((data.index[i], current_close, 'exit short'))
+                    position = None
+
+        data['BOS_Candle'] = bos_candles
+        data['Candle_Color_Mode'] = candle_color_modes
+        return data
+
+    def plot(self, data, symbol):
+        fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
+
+        fig.add_trace(go.Candlestick(
+            x=data.index,
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            name='Price',
+            increasing_line_color='green',
+            decreasing_line_color='red'
+        ))
+
+        bar_index_to_date = {row['bar_index']: idx for idx, row in data.iterrows()}
+
+        for box in self.short_boxes:
+            left_date = bar_index_to_date.get(box['left'], data.index[0])
+            fig.add_shape(
+                type="rect", x0=left_date, y0=box['bottom'], x1=data.index[-1], y1=box['top'],
+                line=dict(width=0), fillcolor="rgba(255, 0, 0, 0.3)", layer="below"
+            )
+
+        for box in self.long_boxes:
+            left_date = bar_index_to_date.get(box['left'], data.index[0])
+            fig.add_shape(
+                type="rect", x0=left_date, y0=box['bottom'], x1=data.index[-1], y1=box['top'],
+                line=dict(width=0), fillcolor="rgba(0, 255, 0, 0.3)", layer="below"
+            )
+
+        for line in self.bos_lines:
+            x0_date = bar_index_to_date.get(line['x0'], data.index[0])
+            x1_date = bar_index_to_date.get(line['x1'], data.index[-1])
+            fig.add_shape(
+                type="line", x0=x0_date, y0=line['y0'], x1=x1_date, y1=line['y1'],
+                line=dict(color=line['color'], width=2)
+            )
+
+        for entry in self.entries:
+            fig.add_trace(go.Scatter(x=[entry[0]], y=[entry[1]], mode='markers',
+                                     marker=dict(color='blue', size=10), name=entry[2]))
+
+        for exit in self.exits:
+            fig.add_trace(go.Scatter(x=[exit[0]], y=[exit[1]], mode='markers',
+                                     marker=dict(color='black', size=10, symbol='x'), name=exit[2]))
+
+        fig.update_layout(
+            title=f'Order Blocks + Strategy ({symbol})',
+            xaxis_title='Date',
+            yaxis_title='Price',
+            xaxis_rangeslider_visible=False,
+            height=700,
+            width=1100
+        )
+        return fig
+
+if __name__ == "__main__":
+    ob_indicator = OrderBlocksIndicator(candle_range=15, show_pdh_pdl=False, show_bearish_bos=True, show_bullish_bos=True)
+    symbol = "AAPL"
+    data = ob_indicator.load_data(symbol, period="6mo", interval="1d")
+    processed_data = ob_indicator.process_data(data)
+    fig = ob_indicator.plot(processed_data, symbol)
+    fig.show()
